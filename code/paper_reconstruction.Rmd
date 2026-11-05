@@ -1,0 +1,967 @@
+---
+title: "Competing-Risks Paper Reconstruction"
+subtitle: "Figures 2, 3, and 4"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    self_contained: true
+params:
+  simulations: 20
+  seed: 20201186
+---
+
+This report runs directly from the repository. It reads the released formatted
+data from `data/` and the released posterior chains from `output/`. It does not
+save figures or tables to separate folders. Each plot is generated directly in
+the knitted report.
+
+```{r setup}
+####### setting up the report #######
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = FALSE,
+  fig.align = "center",
+  out.width = "100%",
+  dpi = 160
+)
+
+report_input <- knitr::current_input(dir = TRUE)
+
+if (length(report_input) == 1L &&
+    !is.na(report_input) &&
+    nzchar(report_input)) {
+  code_dir <- dirname(normalizePath(report_input, mustWork = TRUE))
+} else if (file.exists("main_inference_v1.r") && dir.exists("../data")) {
+  code_dir <- normalizePath(".", mustWork = TRUE)
+} else if (dir.exists("code") && dir.exists("data")) {
+  code_dir <- normalizePath("code", mustWork = TRUE)
+} else {
+  stop("open this report from either the repository root or its code folder")
+}
+
+repository_root <- normalizePath(file.path(code_dir, ".."), mustWork = TRUE)
+stopifnot(
+  dir.exists(file.path(repository_root, "data", "formatted")),
+  dir.exists(file.path(repository_root, "output", "mcmc inference"))
+)
+```
+
+```{r helper-functions, echo=FALSE}
+####### defining the reconstruction functions #######
+read_numeric_csv <- function(path) {
+  scan(path, what = numeric(), quiet = TRUE, sep = ",")
+}
+
+posterior_summary <- function(directory, parameter, tail_n = NULL) {
+  path <- file.path(directory, paste0(parameter, "_mc.csv"))
+  x <- read_numeric_csv(path)
+  if (!is.null(tail_n) && length(x) > tail_n) x <- tail(x, tail_n)
+  q <- unname(quantile(x, c(0.025, 0.5, 0.975), na.rm = TRUE))
+  data.frame(parameter = parameter, lower = q[1], median = q[2], upper = q[3])
+}
+
+posterior_median <- function(directory, parameter, tail_n = NULL) {
+  posterior_summary(directory, parameter, tail_n)$median
+}
+
+haversine_matrix <- function(recipient_coords, donor_coords) {
+  to_rad <- pi / 180
+  lon1 <- recipient_coords[, 1] * to_rad
+  lat1 <- recipient_coords[, 2] * to_rad
+  lon2 <- donor_coords[, 1] * to_rad
+  lat2 <- donor_coords[, 2] * to_rad
+  dlon <- outer(lon1, lon2, "-")
+  dlat <- outer(lat1, lat2, "-")
+  a <- sin(dlat / 2)^2 + outer(cos(lat1), cos(lat2)) * sin(dlon / 2)^2
+  a[a < 0] <- 0
+  a[a > 1] <- 1
+  6371.0088 * 2 * atan2(sqrt(a), sqrt(1 - a))
+}
+
+read_era <- function(repository_root, era, n_rows = NULL) {
+  directory <- file.path(repository_root, "data", "formatted", era)
+  read_one <- function(name) {
+    x <- read.csv(file.path(directory, name), check.names = FALSE)
+    if (!is.null(n_rows)) x <- x[seq_len(min(n_rows, nrow(x))), , drop = FALSE]
+    x
+  }
+  cases <- read_one("inferred_cases_urban.csv")
+  population <- read_one("inferred_pop_urban.csv")
+  susceptibles <- read_one("susceptibles_urban.csv")
+  coordinates <- read.csv(
+    file.path(directory, "coordinates_urban.csv"), check.names = FALSE
+  )
+
+  drop <- intersect(c("Yeovil.RD", "City.of.London"), names(cases))
+  keep <- !names(cases) %in% drop
+  cases <- cases[, keep, drop = FALSE]
+  population <- population[, keep, drop = FALSE]
+  susceptibles <- susceptibles[, keep, drop = FALSE]
+  coordinates <- coordinates[, keep, drop = FALSE]
+
+  list(
+    time = cases[[1]],
+    cases = as.matrix(cases[, -1, drop = FALSE]),
+    population = as.matrix(population[, -1, drop = FALSE]),
+    susceptibles = as.matrix(susceptibles[, -1, drop = FALSE]),
+    coordinates = t(as.matrix(coordinates[, -1, drop = FALSE])),
+    names = names(cases)[-1]
+  )
+}
+
+read_small_cities <- function(repository_root, era) {
+  path <- file.path(
+    repository_root, "output", "mcmc inference", era, "small_cities.csv"
+  )
+  as.character(read.csv(path, check.names = FALSE)[[1]])
+}
+
+observed_event_summaries <- function(case_matrix) {
+  n <- ncol(case_matrix)
+  out <- matrix(NA_real_, nrow = n, ncol = 6)
+  colnames(out) <- c(
+    "cycle_mean", "cycle_sd", "reintroductions", "zeros",
+    "duration_mean", "duration_sd"
+  )
+  for (j in seq_len(n)) {
+    x <- case_matrix[, j]
+    starts <- which(x[-length(x)] == 0 & x[-1] > 0)
+    ends <- which(x[-length(x)] > 0 & x[-1] == 0)
+    if (length(starts) && length(ends) && ends[1] < starts[1]) ends <- ends[-1]
+    k <- min(length(starts), length(ends))
+    durations <- if (k) ends[seq_len(k)] - starts[seq_len(k)] + 1 else numeric()
+    cycles <- diff(starts)
+    out[j, ] <- c(
+      if (length(cycles)) mean(cycles) else NA,
+      if (length(cycles) > 1) sd(cycles) else NA,
+      length(starts), sum(x == 0),
+      if (length(durations)) mean(durations) else NA,
+      if (length(durations) > 1) sd(durations) else NA
+    )
+  }
+  as.data.frame(out)
+}
+
+simulate_absence_presence <- function(rate, average_population, a, b, psi,
+                                      first_zero, n_sim = 20L,
+                                      seed = 20201186L) {
+  set.seed(seed)
+  n_city <- nrow(rate)
+  n_time <- ncol(rate)
+  result <- array(
+    NA_real_, dim = c(n_sim, n_city, 6L),
+    dimnames = list(
+      NULL, NULL,
+      c("cycle_mean", "cycle_sd", "reintroductions", "zeros",
+        "duration_mean", "duration_sd")
+    )
+  )
+  nb_mu <- a * exp(b * log(average_population))
+  nb_size <- psi / log(average_population)
+
+  for (s in seq_len(n_sim)) {
+    immune_until <- first_zero - 1L
+    starts <- vector("list", n_city)
+    durations <- vector("list", n_city)
+    occupied <- matrix(FALSE, nrow = n_city, ncol = n_time)
+
+    for (tt in seq_len(n_time)) {
+      eligible <- tt >= first_zero & tt > immune_until
+      if (!any(eligible)) next
+      p <- -expm1(-pmax(rate[eligible, tt], 0))
+      hit_local <- runif(sum(eligible)) < p
+      if (!any(hit_local)) next
+      hit <- which(eligible)[hit_local]
+      duration <- 2L + rnbinom(length(hit), mu = nb_mu[hit], size = nb_size[hit])
+      duration[!is.finite(duration)] <- 2L
+      for (ii in seq_along(hit)) {
+        city <- hit[ii]
+        dur <- as.integer(duration[ii])
+        starts[[city]] <- c(starts[[city]], tt)
+        durations[[city]] <- c(durations[[city]], dur)
+        last <- min(n_time, tt + dur - 1L)
+        if (last >= tt + 1L) occupied[city, (tt + 1L):last] <- TRUE
+        immune_until[city] <- tt + dur - 1L
+      }
+    }
+
+    for (j in seq_len(n_city)) {
+      cycles <- diff(starts[[j]])
+      duration <- durations[[j]]
+      result[s, j, ] <- c(
+        if (length(cycles)) mean(cycles) else NA,
+        if (length(cycles) > 1L) sd(cycles) else NA,
+        length(starts[[j]]), n_time - sum(occupied[j, ]),
+        if (length(duration)) mean(duration) else NA,
+        if (length(duration) > 1L) sd(duration) else NA
+      )
+    }
+  }
+  result
+}
+
+bin_predictive_summaries <- function(simulated, observed, average_population,
+                                     upper = 90000, n_bin = 40L) {
+  breaks <- seq(0, upper, length.out = n_bin + 1L)
+  metrics <- dimnames(simulated)[[3]]
+  rows <- vector("list", length(metrics) * n_bin)
+  z <- 1L
+  for (metric in metrics) {
+    for (i in seq_len(n_bin)) {
+      members <- which(
+        average_population > breaks[i] &
+        average_population <= breaks[i + 1L]
+      )
+      values <- as.vector(simulated[, members, metric, drop = FALSE])
+      q <- if (length(values)) {
+        quantile(values, c(0.025, 0.5, 0.975), na.rm = TRUE)
+      } else rep(NA, 3)
+      obs <- if (length(members)) {
+        median(observed[members, metric], na.rm = TRUE)
+      } else NA
+      rows[[z]] <- data.frame(
+        metric = metric,
+        bin = i,
+        population_upper = breaks[i + 1L],
+        lower = q[1],
+        median = q[2],
+        upper = q[3],
+        observed = obs
+      )
+      z <- z + 1L
+    }
+  }
+  do.call(rbind, rows)
+}
+
+source_attribution <- function(era, recipients, row_index, parameters, tau) {
+  recipient_index <- match(recipients, era$names)
+  stopifnot(!anyNA(recipient_index))
+  donor_names <- era$names
+  recipient_coords <- era$coordinates[recipient_index, , drop = FALSE]
+  distance <- haversine_matrix(recipient_coords, era$coordinates)
+  distance[distance < 1e-8] <- Inf
+  cases <- era$cases[row_index, , drop = FALSE]
+  population <- era$population[row_index, recipient_index, drop = FALSE]
+
+  city_rows <- vector("list", length(recipients))
+  event_rows <- list()
+  event_z <- 1L
+  for (r in seq_along(recipients)) {
+    recipient_cases <- cases[, recipient_index[r]]
+    events <- if (length(recipient_cases) > 1L) {
+      which(
+        recipient_cases[-length(recipient_cases)] == 0 &
+        recipient_cases[-1] > 0
+      )
+    } else integer()
+    if (!length(events)) {
+      city_rows[[r]] <- data.frame(
+        city = recipients[r], n_events = 0,
+        background = NA, gravity = NA,
+        dominant_source = NA, dominant_share = NA,
+        dominant_distance_km = NA
+      )
+      next
+    }
+    donor_incidence <- cases[events, , drop = FALSE]^parameters$alpha_1
+    base <- parameters$beta * distance[r, ]^(-parameters$rho)
+    gravity <- sweep(donor_incidence, 2, base, "*")
+    gravity <- gravity * population[events, r]^parameters$alpha_2
+    total <- tau + rowSums(gravity)
+    good <- is.finite(total) & total > 0
+    gravity <- gravity[good, , drop = FALSE]
+    total <- total[good]
+    background <- tau / total
+    source_share <- colMeans(gravity / total)
+    best <- which.max(source_share)
+    city_rows[[r]] <- data.frame(
+      city = recipients[r],
+      n_events = length(total),
+      background = mean(background),
+      gravity = mean(1 - background),
+      dominant_source = donor_names[best],
+      dominant_share = source_share[best],
+      dominant_distance_km = distance[r, best]
+    )
+    event_rows[[event_z]] <- data.frame(
+      city = recipients[r],
+      time_index = row_index[events[good]],
+      background = background,
+      gravity = 1 - background
+    )
+    event_z <- event_z + 1L
+  }
+  list(
+    city = do.call(rbind, city_rows),
+    event = if (length(event_rows)) do.call(rbind, event_rows) else data.frame(),
+    coordinates = recipient_coords,
+    donor_names = donor_names
+  )
+}
+
+local_moran_classes <- function(values, coords, k = 8L,
+                                permutations = 499L, seed = 1186L) {
+  set.seed(seed)
+  good <- is.finite(values)
+  out <- rep("not significant", length(values))
+  if (sum(good) <= k + 2L) return(out)
+  z <- as.numeric(scale(values[good]))
+  d <- haversine_matrix(
+    coords[good, , drop = FALSE], coords[good, , drop = FALSE]
+  )
+  diag(d) <- Inf
+  neighbours <- t(apply(d, 1, order))[
+    seq_len(sum(good)), seq_len(k), drop = FALSE
+  ]
+  observed <- vapply(seq_along(z), function(i) {
+    z[i] * mean(z[neighbours[i, ]])
+  }, numeric(1))
+  p <- numeric(length(z))
+  for (i in seq_along(z)) {
+    perm <- replicate(
+      permutations,
+      z[i] * mean(sample(z[-i], k, replace = FALSE))
+    )
+    p[i] <- (1 + sum(abs(perm) >= abs(observed[i]))) / (permutations + 1)
+  }
+  local_mean <- vapply(seq_along(z), function(i) {
+    mean(z[neighbours[i, ]])
+  }, numeric(1))
+  classes <- ifelse(
+    p <= 0.05 & z > 0 & local_mean > 0,
+    "unidentifiable hotspot",
+    ifelse(
+      p <= 0.05 & z < 0 & local_mean < 0,
+      "gravity hotspot",
+      "not significant"
+    )
+  )
+  out[good] <- classes
+  out
+}
+
+pairwise_synchrony <- function(case_matrix, coords, max_distance = 320) {
+  correlation <- suppressWarnings(
+    cor(case_matrix, use = "pairwise.complete.obs")
+  )
+  distance <- haversine_matrix(coords, coords)
+  upper <- upper.tri(distance)
+  d <- distance[upper]
+  y <- correlation[upper]
+  good <- is.finite(d) & is.finite(y) & d <= max_distance
+  d <- d[good]
+  y <- y[good]
+  grid <- seq(0, max_distance, by = 5)
+  fit <- try(smooth.spline(d, y, spar = 0.65), silent = TRUE)
+  prediction <- if (inherits(fit, "try-error")) {
+    approx(d[order(d)], y[order(d)], xout = grid, rule = 2)$y
+  } else predict(fit, grid)$y
+  data.frame(
+    distance_km = grid,
+    synchrony = pmax(-0.05, pmin(1, prediction))
+  )
+}
+
+make_land_outline <- function(coords, ratio = 0.12) {
+  if (requireNamespace("sf", quietly = TRUE) &&
+      "st_concave_hull" %in% getNamespaceExports("sf")) {
+    geometry <- sf::st_sfc(sf::st_multipoint(coords), crs = 4326)
+    outline <- sf::st_concave_hull(
+      geometry, ratio = ratio, allow_holes = FALSE
+    )
+    xy <- sf::st_coordinates(outline)
+    return(xy[, c("X", "Y"), drop = FALSE])
+  }
+  hull <- chull(coords[, 1], coords[, 2])
+  coords[c(hull, hull[1]), , drop = FALSE]
+}
+
+panel_label <- function(label, x = 0.01, y = 0.99) {
+  usr <- par("usr")
+  text(
+    usr[1] + x * diff(usr[1:2]),
+    usr[3] + y * diff(usr[3:4]),
+    label,
+    font = 2,
+    adj = c(0, 1),
+    xpd = NA
+  )
+}
+```
+
+# Loading the released model inputs
+
+```{r load-inputs}
+####### loading the released data and posterior chains #######
+pre <- read_era(repository_root, "prevac", n_rows = 534L)
+vac <- read_era(repository_root, "vac")
+
+pre_mcmc <- file.path(
+  repository_root, "output", "mcmc inference", "pre_vac"
+)
+vac_mcmc <- file.path(
+  repository_root, "output", "mcmc inference", "vac"
+)
+
+pre_small <- read_small_cities(repository_root, "pre_vac")
+vac_small <- read_small_cities(repository_root, "vac")
+
+pre_parameters <- list(
+  beta = posterior_median(pre_mcmc, "beta_coupling", 50000L),
+  alpha_1 = posterior_median(pre_mcmc, "alpha_1", 50000L),
+  alpha_2 = posterior_median(pre_mcmc, "alpha_2", 50000L),
+  rho = posterior_median(pre_mcmc, "rho", 50000L),
+  eta = posterior_median(pre_mcmc, "eta", 50000L),
+  tau = posterior_median(pre_mcmc, "tau", 50000L),
+  a = posterior_median(pre_mcmc, "a", 50000L),
+  b = posterior_median(pre_mcmc, "b", 50000L),
+  psi = posterior_median(pre_mcmc, "psi", 50000L)
+)
+
+vac_parameters <- list(
+  beta = posterior_median(vac_mcmc, "beta_coupling"),
+  alpha_1 = posterior_median(vac_mcmc, "alpha_1"),
+  alpha_2 = posterior_median(vac_mcmc, "alpha_2"),
+  rho = posterior_median(vac_mcmc, "rho"),
+  eta = posterior_median(vac_mcmc, "eta")
+)
+
+simulation_settings <- data.frame(
+  workflow = c("authors' released script", "this abridged report"),
+  forward_simulations = c(100, params$simulations)
+)
+knitr::kable(simulation_settings)
+```
+
+# Figure 2: posterior-predictive reconstruction
+
+```{r calculate-figure-2}
+####### calculating the figure 2 predictive summaries #######
+pre_recipient_index <- match(pre_small, pre$names)
+pre_distance <- haversine_matrix(
+  pre$coordinates[pre_recipient_index, , drop = FALSE],
+  pre$coordinates
+)
+pre_distance[pre_distance < 1e-8] <- Inf
+
+spatial_kernel <- pre_distance^(-pre_parameters$rho)
+donor_signal <- t(pre$cases^pre_parameters$alpha_1)
+gravity_force <- spatial_kernel %*% donor_signal
+n_term <- t(
+  pre$population[, pre_recipient_index, drop = FALSE]^pre_parameters$alpha_2
+)
+s_term <- t(
+  pre$susceptibles[, pre_recipient_index, drop = FALSE]^pre_parameters$eta
+)
+rate <- s_term * (
+  pre_parameters$tau + pre_parameters$beta * n_term * gravity_force
+)
+
+first_zero <- apply(
+  pre$cases[, pre_recipient_index, drop = FALSE],
+  2,
+  function(x) which(x == 0)[1]
+)
+first_zero[!is.finite(first_zero)] <- nrow(pre$cases) + 1L
+
+average_population <- colMeans(
+  pre$population[, pre_recipient_index, drop = FALSE]
+)
+
+simulated <- simulate_absence_presence(
+  rate,
+  average_population,
+  pre_parameters$a,
+  pre_parameters$b,
+  pre_parameters$psi,
+  first_zero,
+  n_sim = params$simulations,
+  seed = params$seed
+)
+
+observed <- observed_event_summaries(
+  pre$cases[, pre_recipient_index, drop = FALSE]
+)
+
+predictive <- bin_predictive_summaries(
+  simulated,
+  observed,
+  average_population
+)
+
+metric_labels <- c(
+  cycle_mean = "Epidemic cycles (mean)",
+  cycle_sd = "Epidemic cycles (s.d.)",
+  reintroductions = "Number of reintroductions",
+  zeros = "Number of zeros",
+  duration_mean = "Epidemic durations (mean)",
+  duration_sd = "Epidemic durations (s.d.)"
+)
+
+metric_order <- c(
+  "cycle_mean", "cycle_sd", "reintroductions", "zeros",
+  "duration_mean", "duration_sd"
+)
+```
+
+```{r plot-figure-2, fig.width=11, fig.height=6.4}
+####### plotting figure 2 directly in the report #######
+layout(matrix(1:6, 2, 3, byrow = TRUE))
+par(
+  mar = c(3.5, 4.2, 1.1, 0.7),
+  mgp = c(2.3, 0.7, 0),
+  family = "sans",
+  cex.axis = 0.9,
+  cex.lab = 0.95
+)
+
+for (metric in metric_order) {
+  d <- predictive[predictive$metric == metric, ]
+  ylim <- range(c(0, d$upper, d$observed), na.rm = TRUE)
+  plot(
+    d$population_upper,
+    d$observed,
+    type = "n",
+    xlab = "Average population level",
+    ylab = metric_labels[[metric]],
+    xlim = c(0, 90000),
+    ylim = ylim,
+    las = 1,
+    xaxt = "n"
+  )
+  axis(
+    1,
+    at = c(0, 22500, 45000, 67500, 90000),
+    labels = format(
+      c(0, 22500, 45000, 67500, 90000),
+      big.mark = ",",
+      scientific = FALSE
+    )
+  )
+  polygon(
+    c(d$population_upper, rev(d$population_upper)),
+    c(d$lower, rev(d$upper)),
+    col = "#D0D2D4",
+    border = NA
+  )
+  points(d$population_upper, d$observed, pch = 20, cex = 0.66)
+  box()
+}
+```
+
+# Figure 3: prevaccination source attribution
+
+```{r calculate-figure-3}
+####### calculating the figure 3 source attribution #######
+attrib_3 <- source_attribution(
+  pre,
+  pre_small,
+  seq_len(nrow(pre$cases)),
+  pre_parameters,
+  pre_parameters$tau
+)
+
+coords_3 <- attrib_3$coordinates
+core <- c(
+  "London", "Birmingham", "Liverpool", "Manchester", "Sheffield",
+  "Leeds", "Newcastle", "Bristol", "Cardiff", "Swansea",
+  "Plymouth", "Norwich", "Portsmouth"
+)
+core_colors <- c(
+  London = "#F0E442",
+  Birmingham = "#56B4E9",
+  Liverpool = "#0072B2",
+  Manchester = "#009E73",
+  Sheffield = "#D55E00",
+  Leeds = "#CC79A7",
+  Newcastle = "#E69F00",
+  Bristol = "#B2DF8A",
+  Cardiff = "#F781BF",
+  Swansea = "#E31A1C",
+  Plymouth = "#FFB000",
+  Norwich = "#984EA3",
+  Portsmouth = "#A6CEE3"
+)
+
+attrib_3$city$category <- ifelse(
+  attrib_3$city$dominant_source %in% core,
+  attrib_3$city$dominant_source,
+  "Other"
+)
+attrib_3$city$lisa <- local_moran_classes(
+  attrib_3$city$background,
+  coords_3
+)
+
+land_3 <- make_land_outline(pre$coordinates)
+global_3 <- colMeans(
+  attrib_3$event[, c("background", "gravity")],
+  na.rm = TRUE
+)
+other_distance <- attrib_3$city$dominant_distance_km[
+  attrib_3$city$category == "Other"
+]
+```
+
+```{r plot-figure-3, fig.width=10.5, fig.height=8.2}
+####### plotting figure 3 directly in the report #######
+layout(
+  matrix(c(1, 3, 2, 4), 2, 2, byrow = TRUE),
+  widths = c(1, 1.25),
+  heights = c(1, 1)
+)
+
+par(mar = c(4, 6.2, 2, 1), family = "sans", mgp = c(2.4, 0.7, 0))
+barplot(
+  global_3[c("gravity", "background")],
+  horiz = TRUE,
+  names.arg = c("Gravity", "Unidentifiable"),
+  col = "#BDBDBD",
+  border = "#555555",
+  xlim = c(0, 1),
+  xlab = "Probability",
+  las = 1
+)
+panel_label("a")
+
+par(mar = c(4, 4, 2, 1))
+plot(
+  land_3,
+  type = "n",
+  asp = 1,
+  xlab = "Longitude",
+  ylab = "Latitude",
+  xlim = c(-6, 2),
+  ylim = c(50, 55.7),
+  las = 1
+)
+polygon(land_3, col = "#F4F4F4", border = "#C7C7C7", lwd = 1)
+significant <- attrib_3$city$lisa != "not significant"
+lisa_colors <- c(
+  "unidentifiable hotspot" = "#FF1A1A",
+  "gravity hotspot" = "#AFAFAF"
+)
+points(
+  coords_3[significant, ],
+  pch = 15,
+  col = lisa_colors[attrib_3$city$lisa[significant]],
+  cex = 0.65
+)
+named <- c(
+  Norwich = "NOR", London = "LON", Manchester = "MAN",
+  Liverpool = "LIV", Birmingham = "BIR", Swansea = "SWA",
+  Cardiff = "CAR", Plymouth = "PLY"
+)
+idx <- match(names(named), pre$names)
+ok <- !is.na(idx)
+text(
+  pre$coordinates[idx[ok], 1],
+  pre$coordinates[idx[ok], 2],
+  unname(named[ok]),
+  cex = 0.72,
+  pos = 3
+)
+panel_label("b")
+
+plot(
+  land_3,
+  type = "n",
+  asp = 1,
+  xlab = "Longitude",
+  ylab = "Latitude",
+  xlim = c(-6, 2),
+  ylim = c(50, 56),
+  las = 1
+)
+polygon(land_3, col = "#F4F4F4", border = "#C7C7C7", lwd = 1)
+category_colors <- c(Other = "#111111", core_colors)
+point_size <- 0.35 + 2.1 * attrib_3$city$dominant_share
+points(
+  coords_3,
+  pch = 21,
+  bg = category_colors[attrib_3$city$category],
+  col = "#222222",
+  cex = point_size,
+  lwd = 0.4
+)
+legend(
+  "topright",
+  legend = names(category_colors),
+  pt.bg = category_colors,
+  pch = 21,
+  pt.cex = 0.75,
+  cex = 0.52,
+  bty = "n",
+  ncol = 2
+)
+panel_label("c")
+
+density_3 <- density(
+  other_distance[is.finite(other_distance)],
+  from = 0,
+  to = 150,
+  na.rm = TRUE
+)
+plot(
+  density_3,
+  type = "n",
+  xlim = c(0, 150),
+  xlab = "Distance of spread (km)",
+  ylab = "Density",
+  main = "",
+  las = 1
+)
+polygon(
+  c(density_3$x, rev(density_3$x)),
+  c(density_3$y, rep(0, length(density_3$y))),
+  col = "#888888",
+  border = "#333333"
+)
+panel_label("d")
+```
+
+# Figure 4: vaccination-era changes
+
+```{r calculate-figure-4}
+####### calculating the figure 4 risk classes and synchrony #######
+periods <- data.frame(
+  label = c(
+    "1960-64", "1970-74", "1975-79",
+    "1980-84", "1985-89", "1990-94"
+  ),
+  start = c(60, 70, 75, 80, 85, 90),
+  end = c(65, 75, 80, 85, 90, 95),
+  tau_file = c("tau", "tau_2", "tau_2", "tau_3", "tau_4", "tau_5")
+)
+
+period_results <- vector("list", nrow(periods))
+synchrony_results <- vector("list", nrow(periods))
+global_4 <- data.frame(
+  period = periods$label,
+  gravity = NA_real_,
+  background = NA_real_
+)
+
+for (i in seq_len(nrow(periods))) {
+  rows <- which(
+    vac$time >= periods$start[i] & vac$time < periods$end[i]
+  )
+  tau_i <- posterior_median(vac_mcmc, periods$tau_file[i])
+  attribution <- source_attribution(
+    vac,
+    vac_small,
+    rows,
+    vac_parameters,
+    tau_i
+  )
+  attribution$city$period <- periods$label[i]
+  attribution$city$dominant_class <- ifelse(
+    attribution$city$gravity >= attribution$city$background,
+    "Gravity",
+    "Unidentifiable"
+  )
+  attribution$city$class_share <- pmax(
+    attribution$city$gravity,
+    attribution$city$background
+  )
+  period_results[[i]] <- attribution$city
+
+  global_4$background[i] <- mean(
+    attribution$city$dominant_class == "Unidentifiable",
+    na.rm = TRUE
+  )
+  global_4$gravity[i] <- 1 - global_4$background[i]
+
+  synchrony <- pairwise_synchrony(
+    vac$cases[rows, , drop = FALSE],
+    vac$coordinates
+  )
+  synchrony$period <- periods$label[i]
+  synchrony_results[[i]] <- synchrony
+}
+
+city_4 <- do.call(rbind, period_results)
+synchrony_4 <- do.call(rbind, synchrony_results)
+coords_4 <- vac$coordinates[match(vac_small, vac$names), , drop = FALSE]
+land_4 <- make_land_outline(vac$coordinates)
+
+coverage <- c(0.00, 0.50, 0.50, 0.65, 0.84, 0.93)
+line_colors <- c(
+  "#222222", "#E41A1C", "#FB6A4A",
+  "#CB181D", "#969696", "#525252"
+)
+line_types <- c(1, 3, 2, 4, 5, 6)
+```
+
+## Figure 4a: location-wise risk classification
+
+```{r plot-figure-4a, fig.width=13, fig.height=5.2}
+####### plotting figure 4a #######
+par(mar = c(4, 4, 2.8, 0.8), family = "sans", mgp = c(2.4, 0.7, 0))
+plot.new()
+plot.window(xlim = c(0, 6), ylim = c(0, 1))
+
+for (i in seq_len(6)) {
+  d <- city_4[city_4$period == periods$label[i], ]
+  x_offset <- i - 1
+  x <- x_offset + (coords_4[, 1] + 6) / 8
+  y <- (coords_4[, 2] - 50) / 6
+  polygon(
+    x_offset + (land_4[, 1] + 6) / 8,
+    (land_4[, 2] - 50) / 6,
+    col = "#F1F1F1",
+    border = "#BDBDBD"
+  )
+  colors <- ifelse(
+    d$dominant_class == "Gravity",
+    "#72C5E8",
+    "#111111"
+  )
+  points(
+    x,
+    y,
+    pch = 21,
+    bg = colors,
+    col = colors,
+    cex = 0.15 + 1.05 * d$class_share
+  )
+  rect(
+    x_offset,
+    1,
+    x_offset + 1,
+    1.08,
+    col = "#D9D9D9",
+    border = "#555555",
+    xpd = NA
+  )
+  text(
+    x_offset + 0.5,
+    1.04,
+    periods$label[i],
+    cex = 0.8,
+    xpd = NA
+  )
+}
+
+axis(1, at = seq(0.5, 5.5, 1), labels = rep("", 6), tick = FALSE)
+mtext("Longitude", 1, line = 2.2)
+mtext("Latitude", 2, line = 2.2)
+legend(
+  "bottomleft",
+  legend = c("Gravity", "Unidentifiable"),
+  pch = 21,
+  pt.bg = c("#72C5E8", "#111111"),
+  bty = "n",
+  horiz = TRUE,
+  cex = 0.9
+)
+panel_label("a", y = 1.08)
+```
+
+## Figure 4b: risk distribution and vaccine coverage
+
+```{r plot-figure-4b, fig.width=7.2, fig.height=5.4}
+####### plotting figure 4b #######
+par(mar = c(7, 4.5, 2, 5), family = "sans", mgp = c(2.5, 0.7, 0))
+mids <- barplot(
+  t(as.matrix(global_4[, c("gravity", "background")])),
+  col = c("#72C5E8", "#111111"),
+  names.arg = global_4$period,
+  las = 2,
+  ylab = "Risk distribution",
+  ylim = c(0, 1),
+  border = NA
+)
+
+par(new = TRUE)
+plot(
+  mids,
+  coverage,
+  type = "o",
+  col = "red",
+  pch = 20,
+  axes = FALSE,
+  xlab = "",
+  ylab = "",
+  ylim = c(0, 1),
+  xlim = range(mids) + c(-0.6, 0.6)
+)
+axis(4, col.axis = "red", las = 1)
+mtext("Vaccine coverage", 4, line = 2.5, col = "red")
+legend(
+  "bottomleft",
+  legend = c("Gravity", "Unidentifiable"),
+  fill = c("#72C5E8", "#111111"),
+  bty = "n",
+  cex = 0.78,
+  horiz = TRUE
+)
+panel_label("b")
+```
+
+```{r summarize-figure-4b}
+####### summarizing the figure 4b risk classes #######
+knitr::kable(global_4, digits = 3)
+```
+
+## Figure 4c: spatial synchrony
+
+```{r plot-figure-4c, fig.width=7.2, fig.height=5.4}
+####### plotting figure 4c directly in the report #######
+par(mar = c(4.5, 4.5, 2, 1), family = "sans", mgp = c(2.5, 0.7, 0))
+plot(
+  0,
+  0,
+  type = "n",
+  xlim = c(0, 320),
+  ylim = c(0, 0.85),
+  xlab = "Distance (km)",
+  ylab = "Synchrony",
+  las = 1
+)
+
+for (i in seq_len(6)) {
+  d <- synchrony_4[synchrony_4$period == periods$label[i], ]
+  lines(
+    d$distance_km,
+    d$synchrony,
+    col = line_colors[i],
+    lty = line_types[i],
+    lwd = 1.6
+  )
+}
+
+legend(
+  "topright",
+  legend = periods$label,
+  col = line_colors,
+  lty = line_types,
+  bty = "n",
+  cex = 0.82
+)
+panel_label("c")
+```
+
+# Validation
+
+```{r validation}
+####### validating the inline reconstruction #######
+stopifnot(
+  nrow(predictive) == 240,
+  sum(is.finite(predictive$observed)) > 200,
+  nrow(attrib_3$city) == 872,
+  mean(attrib_3$event$gravity, na.rm = TRUE) > 0.85,
+  nrow(global_4) == 6,
+  all(abs(global_4$background + global_4$gravity - 1) < 1e-8),
+  all(diff(global_4$background) >= -1e-8),
+  global_4$background[1] < 0.05,
+  global_4$background[6] > 0.90
+)
+
+cat("inline paper reconstruction validation passed")
+```
+
