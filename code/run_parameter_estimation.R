@@ -502,7 +502,7 @@ parameter_names <- c(
 chain <- matrix(
   NA_real_,
   nrow = n_iter,
-  ncol = length(para_current),
+  ncol = 9,
   dimnames = list(NULL, parameter_names)
 )
 
@@ -538,7 +538,7 @@ for (i in 1:n_iter){
   para_current[7] <- mh_tau_out[1]
   log_lh_current <- mh_tau_out[2]
   
-  chain[i, ] <- para_current
+  chain[i, ] <- para_current[1:9]
   likelihood_trace[i] <- log_lh_current
   
   cat("\nIteration", i, "of", n_iter, "\n")
