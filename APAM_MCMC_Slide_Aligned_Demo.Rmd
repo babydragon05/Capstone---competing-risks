@@ -10,7 +10,7 @@ output:
 
 This notebook follows the parameter-estimation pseudocode. Run chunks **in order** from the repository root. It embeds the original Rcpp single-town likelihood and the four proposal functions used by the demo; it does **not** source `main_inference_src_functions_v1.r`. The full data CSVs and posterior CSVs must still exist in their original locations. The original demo uses 10 iterations, while the 1,000-sample burn-in applies only to the separate, precomputed full chains.
 
-## Initialization — one chunk per pseudocode line
+## Initialization
 
 ### Initialize random seed
 
@@ -36,6 +36,11 @@ dir.create(path3, recursive = TRUE, showWarnings = FALSE)
 ### Load packages
 
 ```{r init-packages}
+install.packages(c(
+  "parallel", "Rcpp", "RcppParallel", "MASS",
+  "geosphere", "truncdist", "RcppArmadillo", "future.apply"
+))
+
 library(parallel)
 library(Rcpp)
 library(RcppParallel)
@@ -394,7 +399,7 @@ for (i in 1:n_small_cities){
   t_die_data <- define_die(cases_small_cities[,i+1], n_0=n_0, n_1=n_1) # return a vector indicating the user-defined die time
   list_die_time_data[[i]] <- t_die_data
   
-  print(length(unique(list_influx_time_data[[i]]))- length(unique(list_die_time_data[[i]])))
+  # print(length(unique(list_influx_time_data[[i]]))- length(unique(list_die_time_data[[i]])))
   
   list_influx_time_data_unique[[i]] <- t_influx_data[which(is.na(t_influx_data)==FALSE)]
   
@@ -782,7 +787,7 @@ mh_beta_rho_alphas_eta <- function(beta_rho_alphas_eta_current, log_lh_current, 
 	y <- c(-1,-1, -1, -1, -1)
  	while(y[1]<=0 | y[2]<=0 | y[3]<0 | y[4]<0| y[5]<0){
 	y <-  mvrnorm(1,mu=beta_rho_alphas_eta_current,Sigma=0.2*matrix(c(1e-10,0,0,0,0, 0,1e-3,0,0,0, 0,0,1e-4,0,0, 0,0,0,1e-4,0, 0,0,0,0,1e-4),byrow=TRUE,ncol=5,nrow=5))
-	# y <-  mvrnorm(1,mu=beta_rho_alphas_eta_current,Sigma=0.2*matrix(c(1e-10,0,0,0,0, 0,1e-3,0,0,0, 0,0,1e-4,0,0, 0,0,0,1e-4,0, 0,0,0,0,1e-4),byrow=TRUE,ncol=5,nrow=5))
+	# multivariate normal distribution
 
 	}
 
@@ -1087,7 +1092,8 @@ write.csv(
 
 ### Plot posterior distributions of $\rho$
 
-```{r rho-plot}
+
+```{r rho-plot, fig.width=9, fig.height=5.5, dpi=300}
 breaks <- seq(
   min(c(pre_post, vac_post)),
   max(c(pre_post, vac_post)),
@@ -1096,22 +1102,19 @@ breaks <- seq(
 
 # Define plotting function
 plot_rho <- function() {
-  
-  # Create separate areas for histogram and legend
+
   old_par <- par(no.readonly = TRUE)
   on.exit(par(old_par))
-  
+
+  # Separate histogram and legend
   layout(
     matrix(c(1, 2), nrow = 2),
     heights = c(5, 1.2)
   )
-  
-  # -----------------------------------------
+
   # Main histogram
-  # -----------------------------------------
-  
   par(mar = c(4.5, 4.5, 3, 1))
-  
+
   hist(
     pre_post,
     breaks = breaks,
@@ -1122,7 +1125,7 @@ plot_rho <- function() {
     xlab = expression("Distance-decay exponent " * rho),
     ylab = "Posterior density"
   )
-  
+
   hist(
     vac_post,
     breaks = breaks,
@@ -1131,7 +1134,7 @@ plot_rho <- function() {
     border = NA,
     add = TRUE
   )
-  
+
   # Posterior medians
   abline(
     v = median(pre_post),
@@ -1139,22 +1142,19 @@ plot_rho <- function() {
     lwd = 2,
     col = "steelblue4"
   )
-  
+
   abline(
     v = median(vac_post),
     lty = 3,
     lwd = 2,
     col = "darkorange3"
   )
-  
-  # -----------------------------------------
-  # Separate legend below the histogram
-  # -----------------------------------------
-  
+
+  # Legend
   par(mar = c(0, 0, 0, 0))
-  
+
   plot.new()
-  
+
   legend(
     "center",
     legend = c(
@@ -1177,31 +1177,27 @@ plot_rho <- function() {
     x.intersp = 0.8,
     y.intersp = 1.2
   )
-  
 }
 
-# -----------------------------------------
-# 1. Display in RStudio's Plots pane
-# -----------------------------------------
-
+# Display plot in R Markdown
 plot_rho()
 
-# -----------------------------------------
-# 2. Save the same figure as a PDF
-# -----------------------------------------
-
-pdf(
-  file.path(path3, "rho_comparison.pdf"),
-  width = 9,
-  height = 5.5
+# Save as PDF without creating another R Markdown figure
+invisible(
+  grDevices::pdf(
+    file.path(path3, "rho_comparison.pdf"),
+    width = 9,
+    height = 5.5
+  )
 )
 
 plot_rho()
 
-dev.off()
+invisible(grDevices::dev.off())
 
 cat("\nPosterior comparison displayed and saved!\n")
 ```
+
 
 ## Notes for presentation
 
